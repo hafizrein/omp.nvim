@@ -77,7 +77,9 @@ function M.check()
       connecting = connecting + 1
     else
       connected = connected + 1
-      if not vim.uv.fs_stat(socket_path) then
+      -- Win32 named pipes have no filesystem entry to stat; only AF_UNIX
+      -- socket files can be reaped out from under a live connection.
+      if not socket_path:find("\\\\.\\pipe\\", 1, true) and not vim.uv.fs_stat(socket_path) then
         table.insert(orphaned, socket_path)
       end
     end

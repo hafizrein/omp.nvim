@@ -13,6 +13,21 @@ type ManagedTimer = Timer;
 type ContextMessage = ContextEvent["messages"][number];
 
 const MAX_BUFFER_SIZE = 4 * 1024; // 4KB — paths are ~200 bytes
+
+// Windows: Neovim's uv_pipe_t only speaks Win32 named pipes there (bind/connect
+// on a filesystem path fails with EACCES — libuv never opens AF_UNIX), so the
+// transport is a per-process named pipe and the .info file carries its name in a
+// `pipe` field. A pipe name has no parent directory, hence the file can no
+// longer be `${sockPath}.info`; it is `${pid}.info` in the same sockets dir.
+const IS_WIN = process.platform === "win32";
+const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\omp-nvim-";
+
+// The .info payload. `pipe` is present only on Windows so the Unix file stays
+// byte-identical (older Windows-incapable Neovim plugins read it and derive the
+// socket path from the filename themselves).
+function infoPayload(cwd: string, sockPath: string) {
+	return IS_WIN ? { cwd, pipe: sockPath } : { cwd };
+}
 // macOS reaps per-user $TMPDIR contents: com.apple.bsd.dirhelper runs at boot
 // and daily at 03:35 with CLEAN_FILES_OLDER_THAN_DAYS=3, and connecting to a
 // unix socket never updates its atime — so a busy, healthy socket looks
@@ -199,24 +214,42 @@ function startServer(pi: ExtensionAPI, ctx: ExtensionContext) {
 		state.server = null;
 	}
 
-	try {
-		fs.mkdirSync(path.dirname(sockPath), { recursive: true, mode: 0o700 });
-		fs.chmodSync(path.dirname(sockPath), 0o700);
-	} catch (err) {
-		reportFailure(
-			pi,
-			"cannot prepare sockets directory",
-			(err as Error).message,
-		);
-		return;
+	// Named pipes have no parent directory (path.dirname of the pipe name would
+	// fabricate one), and no filesystem entry to unlink. The namespace is global
+	// instead: a live pipe left by a prior PID holder makes listen() fail with
+	// EADDRINUSE, which reportFailure() and the heal tick absorb.
+	if (!IS_WIN) {
+		try {
+			fs.mkdirSync(path.dirname(sockPath), { recursive: true, mode: 0o700 });
+			fs.chmodSync(path.dirname(sockPath), 0o700);
+		} catch (err) {
+			reportFailure(
+				pi,
+				"cannot prepare sockets directory",
+				(err as Error).message,
+			);
+			return;
+		}
+		// Unconditionally remove our own socket path before listen. Stale-socket
+		// probing only unlinks paths it cannot connect to; if a prior process with
+		// the same PID left a live-looking socket (PID reuse race), the probe leaves
+		// it intact and listen would fail with EADDRINUSE.
+		try {
+			fs.unlinkSync(sockPath);
+		} catch {}
+	} else {
+		// The .info file lives in a directory that still has to exist.
+		try {
+			fs.mkdirSync(path.dirname(infPath), { recursive: true, mode: 0o700 });
+		} catch (err) {
+			reportFailure(
+				pi,
+				"cannot prepare sockets directory",
+				(err as Error).message,
+			);
+			return;
+		}
 	}
-	// Unconditionally remove our own socket path before listen. Stale-socket
-	// probing only unlinks paths it cannot connect to; if a prior process with
-	// the same PID left a live-looking socket (PID reuse race), the probe leaves
-	// it intact and listen would fail with EADDRINUSE.
-	try {
-		fs.unlinkSync(sockPath);
-	} catch {}
 
 	const srv = net.createServer((socket) => {
 		let buffer = "";
@@ -258,7 +291,7 @@ function startServer(pi: ExtensionAPI, ctx: ExtensionContext) {
 
 	srv.listen(sockPath, () => {
 		try {
-			fs.writeFileSync(infPath, JSON.stringify({ cwd: ctx.cwd }));
+			fs.writeFileSync(infPath, JSON.stringify(infoPayload(ctx.cwd, sockPath)));
 			// Marked here, not on a later tick that observes both files: a reaper
 			// can delete them again before the next tick runs, and an outage that
 			// was never marked over would silence its own report.
@@ -294,7 +327,10 @@ function ensureListening(pi: ExtensionAPI, ctx: ExtensionContext) {
 	// listener would never be rebuilt.
 	if (state.server?.listening && fs.existsSync(state.socketPath)) {
 		try {
-			fs.writeFileSync(state.infoPath, JSON.stringify({ cwd: ctx.cwd }));
+			fs.writeFileSync(
+				state.infoPath,
+				JSON.stringify(infoPayload(ctx.cwd, state.socketPath)),
+			);
 			markHealthy(pi);
 			return;
 		} catch {}
@@ -327,7 +363,9 @@ export default function (pi: ExtensionAPI) {
 		const socketsDir = path.join(runtimeDir, "omp-nvim-sockets");
 		try {
 			fs.mkdirSync(socketsDir, { recursive: true, mode: 0o700 });
-			fs.chmodSync(socketsDir, 0o700);
+			// chmod is a no-op-and-throws-on-some-fs on Windows; the directory
+			// there is already per-user under %TEMP%.
+			if (!IS_WIN) fs.chmodSync(socketsDir, 0o700);
 		} catch (err) {
 			// Unwritable or absent runtime dir (read-only $XDG_RUNTIME_DIR, or
 			// /run/user/<uid> missing). Throwing here rejects the host's awaited
@@ -344,13 +382,24 @@ export default function (pi: ExtensionAPI) {
 		state.activeCtx = ctx;
 		state.owner = ctx.sessionManager;
 
-		const sockPath = path.join(socketsDir, `${process.pid}.sock`);
-		const infPath = `${sockPath}.info`;
+		// AF_UNIX file on Unix; Win32 named pipe on Windows, where Neovim's
+		// uv_pipe_t cannot open an AF_UNIX path at all. The .info filename is
+		// `${pid}.sock.info` on Unix (the plugin derives the socket path from it,
+		// so it must not change) and `${pid}.info` on Windows, where the payload's
+		// `pipe` field names the transport instead.
+		const sockPath = IS_WIN
+			? `${WINDOWS_PIPE_PREFIX}${process.pid}`
+			: path.join(socketsDir, `${process.pid}.sock`);
+		const infPath = IS_WIN
+			? path.join(socketsDir, `${process.pid}.info`)
+			: `${sockPath}.info`;
 		state.socketPath = sockPath;
 		state.infoPath = infPath;
 
-		// Probe each socket; connection refused = orphaned process (probe is more
-		// reliable than process.kill — handles PID reuse transparently)
+		// Probe each advertised session; a refused connection means the process is
+		// gone (probe is more reliable than process.kill — handles PID reuse
+		// transparently). On Windows the probe target comes from the .info file
+		// because the pipe name is not derivable from the filename.
 		let existing: string[] = [];
 		try {
 			existing = fs.readdirSync(socketsDir);
@@ -364,11 +413,25 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const staleProbes = existing
-			.filter((f) => f.endsWith(".sock"))
+			.filter((f) => (IS_WIN ? f.endsWith(".info") : f.endsWith(".sock")))
 			.map(
 				(file) =>
 					new Promise<void>((resolve) => {
-						const sockFile = path.join(socketsDir, file);
+						const infoFile = path.join(socketsDir, file);
+						let sockFile = infoFile.replace(/\.info$/, "");
+						if (IS_WIN) {
+							try {
+								const parsed = JSON.parse(fs.readFileSync(infoFile, "utf8"));
+								if (typeof parsed.pipe !== "string") {
+									resolve();
+									return;
+								}
+								sockFile = parsed.pipe;
+							} catch {
+								resolve();
+								return;
+							}
+						}
 						const probe = net.connect(sockFile);
 						probe.on("connect", () => {
 							probe.destroy();
@@ -381,11 +444,14 @@ export default function (pi: ExtensionAPI) {
 							// delete a live peer's files out from under it — that peer
 							// would then be undiscoverable until it restarts.
 							if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
+								// Windows advertises a named pipe and has no socket file.
+								if (!IS_WIN) {
+									try {
+										fs.unlinkSync(`${infoFile.replace(/\.info$/, "")}`);
+									} catch {}
+								}
 								try {
-									fs.unlinkSync(sockFile);
-								} catch {}
-								try {
-									fs.unlinkSync(`${sockFile}.info`);
+									fs.unlinkSync(infoFile);
 								} catch {}
 							}
 							resolve();

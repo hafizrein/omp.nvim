@@ -11,8 +11,8 @@ This plugin allows an active OMP terminal session to perfectly track your cursor
 
 - **Zero-Config Context:** The AI instantly knows your active file—no need to type out paths.
 - **Line-Level Precision:** Sends exact line numbers (e.g., `src/main.ts:42`).
-- **Visual Selection Support:** Highlights exact code blocks (e.g., `src/main.ts:40-50`).
-- **Non-Blocking:** Uses `libuv` Unix sockets for zero impact on editor performance.
+- **Visual Selection Support:** Highlights exact code blocks (e.g., `src/main.ts:40-50`), and a selection survives leaving visual mode while the cursor stays inside it.
+- **Non-Blocking:** Uses `libuv` pipes for zero impact on editor performance — an AF_UNIX socket on Linux/macOS, a Win32 named pipe on Windows.
 
 ## Requirements
 
@@ -67,8 +67,15 @@ can add your own rule to `~/.omp/agent/AGENTS.md`, but it's optional.
 
 The project is split into two halves:
 
-1. **The Neovim Plugin (`lua/omp`):** A lightweight Lua script that hooks into `BufEnter`, `CursorMoved`, and `CursorHold` events. It actively tracks your focused file and broadcasts it via non-blocking `libuv` pipes to matching OMP sockets in `$XDG_RUNTIME_DIR/omp-nvim-sockets` (Linux) or the system temp directory (macOS).
-2. **The OMP Extension (`src/extension.ts`):** A native OMP extension that boots up alongside your terminal. It establishes a Unix domain socket and caches its location so Neovim can find it. It intercepts the active context and invisibly injects it into your prompts.
+1. **The Neovim Plugin (`lua/omp`):** A lightweight Lua script that hooks into `BufEnter`, `CursorMoved`, and `CursorHold` events. It actively tracks your focused file and broadcasts it via non-blocking `libuv` pipes to matching OMP sessions advertised in `$XDG_RUNTIME_DIR/omp-nvim-sockets` (Linux) or the system temp directory (macOS, Windows).
+2. **The OMP Extension (`src/extension.ts`):** A native OMP extension that boots up alongside your terminal. It establishes the transport and caches its location so Neovim can find it. It intercepts the active context and invisibly injects it into your prompts.
+
+Transport is platform-dependent because Neovim's `uv_pipe_t` cannot open an AF_UNIX path on Windows (`bind` and `connect` both fail with `EACCES`):
+
+| Platform | Transport | Advertised as |
+|---|---|---|
+| Linux / macOS | AF_UNIX socket file `<pid>.sock` | `<pid>.sock.info`, `{"cwd": …}` |
+| Windows | Win32 named pipe `\\.\pipe\omp-nvim-<pid>` | `<pid>.info`, `{"cwd": …, "pipe": …}` |
 
 Run `:checkhealth omp` inside Neovim to verify the integration is working correctly.
 

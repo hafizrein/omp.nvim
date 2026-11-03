@@ -18,7 +18,23 @@ print("Running OMP watcher/discovery tests...")
 local root = vim.fn.tempname()
 vim.fn.mkdir(root .. "/a", "p")
 local link = root .. "/link"
-assert_true(uv.fs_symlink(root .. "/a", link), "Could not create symlink")
+
+-- A directory symlink is what exercises the realpath resolution, but creating
+-- one needs SeCreateSymbolicLinkPrivilege (developer mode, or an elevated
+-- shell) on Windows, so a junction stands in there: it is the same reparse
+-- point as far as fs_realpath/fs_stat are concerned, and it needs no privilege.
+local function make_link(target, at)
+  if package.config:sub(1, 1) == "\\" then
+    local win_target = target:gsub("/", "\\")
+    local win_at = at:gsub("/", "\\")
+    -- os.execute returns an exit code here (0 = success), not a boolean.
+    local ok = os.execute(('cmd /c mklink /J "%s" "%s" >nul 2>&1'):format(win_at, win_target))
+    return ok == true or ok == 0
+  end
+  return uv.fs_symlink(target, at) ~= nil
+end
+
+assert_true(make_link(root .. "/a", link), "Could not create directory link")
 vim.env.XDG_RUNTIME_DIR = link
 
 local omp = require("omp")
@@ -28,7 +44,10 @@ local raw_dir = link .. "/omp-nvim-sockets"
 omp.setup()
 assert_true(uv.fs_stat(raw_dir) ~= nil, "setup() should create the sockets directory")
 assert_true(omp._sockets_dir == uv.fs_realpath(raw_dir), "_sockets_dir should be the resolved path")
-assert_true(omp._sockets_dir:find("/a/", 1, true) ~= nil, "_sockets_dir should resolve through the symlink")
+local function has_component(path, name)
+  return path:find("[/\\]" .. name .. "[/\\]", 1, false) ~= nil
+end
+assert_true(has_component(omp._sockets_dir, "a"), "_sockets_dir should resolve through the directory link")
 assert_true(omp._watcher_active(), "setup() should start the fs_event watcher")
 assert_true(
   type(omp._birthtime_reliable()) == "boolean",
@@ -45,7 +64,15 @@ assert_true(omp._watcher_active(), "Repeated setup() should leave a live watcher
 vim.cmd.edit("lua/omp/init.lua")
 vim.api.nvim_exec_autocmds("CursorMoved", {})
 local current, broadcast = omp._broadcast_state()
-assert_true(current == "lua/omp/init.lua:1", "Current path should track the edited buffer, got " .. tostring(current))
+-- The payload keeps the host separator: `fnamemodify(":.")` yields backslashes
+-- on Windows, so compare against the normalized form rather than POSIX slashes.
+local function norm(path)
+  return (path:gsub("\\", "/"))
+end
+assert_true(
+  norm(current) == "lua/omp/init.lua:1",
+  "Current path should track the edited buffer, got " .. tostring(current)
+)
 assert_true(broadcast == current, "CursorMoved should broadcast the new path, got " .. tostring(broadcast))
 
 omp.setup()
@@ -65,11 +92,11 @@ assert_true(omp._watcher_active(), "Watcher should be rebound after the director
 -- scandir pointed at a directory no OMP session binds.
 vim.fn.mkdir(root .. "/b", "p")
 vim.fn.delete(root .. "/a", "rf")
-assert_true(uv.fs_unlink(link), "Could not unlink symlink")
-assert_true(uv.fs_symlink(root .. "/b", link), "Could not retarget symlink")
+assert_true(uv.fs_unlink(link), "Could not unlink directory link")
+assert_true(make_link(root .. "/b", link), "Could not retarget directory link")
 vim.api.nvim_exec_autocmds("BufEnter", {})
 assert_true(omp._sockets_dir == uv.fs_realpath(raw_dir), "_sockets_dir should be re-resolved after recreate")
-assert_true(omp._sockets_dir:find("/b/", 1, true) ~= nil, "_sockets_dir should follow the retargeted symlink")
+assert_true(has_component(omp._sockets_dir, "b"), "_sockets_dir should follow the retargeted link")
 
 -- Test 6: when the directory cannot be recreated, the watcher must report as
 -- not running rather than holding a handle that never fires.

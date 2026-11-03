@@ -19,6 +19,10 @@ end
 -- path -> true (connecting placeholder) or uv_pipe handle (connected).
 -- Tests observe this table to verify cwd-matched sockets are discovered.
 local active_sockets = {}
+-- key (socket path or Win32 pipe name) -> .info path it was advertised in, so a
+-- drop can invalidate the right scanned_mtimes entry. On Windows the key is a
+-- pipe name and no `${key}.info` file exists, so the path cannot be derived.
+local socket_info_paths = {}
 local raw_sockets_dir = (os.getenv("XDG_RUNTIME_DIR") or uv.os_tmpdir()) .. "/omp-nvim-sockets"
 -- Resolved to the real path (no symlinks) in M.setup() after mkdir, so the
 -- FSEvents watcher fires correctly on macOS where os.tmpdir() returns a path
@@ -53,21 +57,25 @@ local function drop_socket(socket_path, pipe)
   -- (which would then be leaked open and never written to).
   if active_sockets[socket_path] == pipe then
     active_sockets[socket_path] = nil
-    scanned_mtimes[socket_path .. ".info"] = nil
+    scanned_mtimes[socket_info_paths[socket_path] or (socket_path .. ".info")] = nil
+    socket_info_paths[socket_path] = nil
   end
 end
 
 local function connect_socket(socket_path, info_path)
   active_sockets[socket_path] = true
+  socket_info_paths[socket_path] = info_path
   local pipe = uv.new_pipe(false)
   if not pipe then
     active_sockets[socket_path] = nil
+    socket_info_paths[socket_path] = nil
     return
   end
 
   pipe:connect(socket_path, function(err)
     if err then
       active_sockets[socket_path] = nil
+      socket_info_paths[socket_path] = nil
       if err ~= "ECONNREFUSED" and err ~= "ENOENT" then
         scanned_mtimes[info_path] = nil
       end
@@ -113,6 +121,21 @@ local function check_and_add_socket(info_path)
     return
   end
 
+  -- Windows: the .info file names a Win32 pipe. Its filename is `${pid}.info`,
+  -- not the transport, so the key has to come out of the payload. (The whole
+  -- file is a named pipe there; a filesystem socket path cannot be bound or
+  -- connected by Neovim's uv_pipe_t.) An .info file left by an AF_UNIX-era OMP
+  -- build has no `pipe` field and is unreachable from Windows, so it is skipped
+  -- rather than retried forever.
+  local is_windows = package.config:sub(1, 1) == "\\"
+  if is_windows and type(info.pipe) ~= "string" then
+    return
+  end
+  local socket_path = info.pipe or info_path:gsub("%.info$", "")
+  if type(socket_path) ~= "string" or socket_path == "" then
+    return
+  end
+
   local cwd = vim.fn.getcwd()
   local real_cwd = uv.fs_realpath(cwd) or cwd
   local real_info_cwd = uv.fs_realpath(info.cwd) or info.cwd
@@ -120,7 +143,6 @@ local function check_and_add_socket(info_path)
     return
   end
 
-  local socket_path = info_path:gsub("%.info$", "")
   if active_sockets[socket_path] then
     return
   end
@@ -294,7 +316,7 @@ local function broadcast_active_file(path)
   end
 end
 
-function M._get_display_path(bufname, buftype, line, v_line, mode)
+function M._get_display_path(bufname, buftype, line, v_line, mode, sticky_start, sticky_end)
   if buftype ~= "" and buftype ~= "acwrite" then
     return "" -- Don't update if it's a terminal or special buffer
   end
@@ -305,12 +327,21 @@ function M._get_display_path(bufname, buftype, line, v_line, mode)
   local filename = vim.fn.fnamemodify(bufname, ":.")
   local display_str = filename .. ":" .. line
 
+  -- Any visual mode is reported as a range, including a collapsed one. Emitting
+  -- `file:642-642` for a single-line selection is what distinguishes "the user
+  -- selected this line" from "the cursor happens to be here" — without it the
+  -- two payloads are byte-identical and the selection intent is lost.
   if mode == "v" or mode == "V" or mode == "\22" then
-    if v_line ~= line then
-      local start_line = math.min(v_line, line)
-      local end_line = math.max(v_line, line)
-      display_str = filename .. ":" .. start_line .. "-" .. end_line
-    end
+    local start_line = math.min(v_line, line)
+    local end_line = math.max(v_line, line)
+    display_str = filename .. ":" .. start_line .. "-" .. end_line
+  elseif sticky_start and line >= sticky_start and line <= sticky_end then
+    -- Sticky replay: the range outlives visual mode while the cursor stays
+    -- inside it. Without this the CursorHold that fires updatetime after Esc
+    -- re-publishes the collapsed `file:<line>` and the selection is gone before
+    -- the user can hand it to OMP. Moving outside the range, or to another
+    -- buffer, drops it (the caller clears the sticky range).
+    display_str = filename .. ":" .. sticky_start .. "-" .. sticky_end
   end
 
   return display_str
@@ -318,6 +349,12 @@ end
 
 local active_watcher = nil
 local last_broadcast_path = nil
+
+-- Selection that survives leaving visual mode: which buffer made it, and the
+-- range. Stored by buffer, not window, so a split showing the same file replays
+-- it too, while switching files drops it.
+local sticky_buf = nil
+local sticky_start, sticky_end = 0, 0
 
 local function update_active_path()
   local buf = vim.api.nvim_get_current_buf()
@@ -327,10 +364,25 @@ local function update_active_path()
   local v_line = vim.fn.line("v")
   local mode = vim.fn.mode()
 
-  local display_str = M._get_display_path(bufname, buftype, line, v_line, mode)
-  if display_str ~= "" then
-    active_relative_path = display_str
+  local in_sticky = sticky_buf == buf and line >= sticky_start and line <= sticky_end
+  local display_str =
+    M._get_display_path(bufname, buftype, line, v_line, mode, in_sticky and sticky_start or nil, sticky_end)
+  if display_str == "" then
+    return -- terminal/special buffer: keep whatever a file buffer published
   end
+
+  if mode == "v" or mode == "V" or mode == "\22" then
+    sticky_buf = buf
+    sticky_start = math.min(v_line, line)
+    sticky_end = math.max(v_line, line)
+  elseif not in_sticky then
+    -- Leaving the range ends the selection for good: without clearing here, a
+    -- cursor that wandered out and back would resurrect a range the user had
+    -- already dropped.
+    sticky_buf = nil
+  end
+
+  active_relative_path = display_str
 end
 
 -- Cheap path: cursor/selection moved, so only the line numbers in the widget
@@ -446,6 +498,8 @@ function M.setup()
   -- Module-scoped, so a repeated setup() would otherwise inherit the old dedupe
   -- value and suppress the first broadcast after a reload.
   last_broadcast_path = nil
+  sticky_buf = nil
+  sticky_start, sticky_end = 0, 0
   -- Rebind before the first scan: sync_sockets() ends in ensure_watcher(false),
   -- which would otherwise bind a handle this call immediately stops and
   -- replaces (two uv_fs_event allocations per setup()).

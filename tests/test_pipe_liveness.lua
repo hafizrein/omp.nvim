@@ -1,7 +1,14 @@
 -- Liveness test for the persistent pipes: a peer that goes away must be
 -- dropped from the live set without waiting for a write to fail. Uses a real
--- Unix socket; no OMP process required.
+-- socket; no OMP process required.
+--
+-- The transport is platform-dependent: an AF_UNIX file on Unix, a Win32 named
+-- pipe on Windows, where libuv cannot bind or connect an AF_UNIX path at all
+-- (bind and connect both fail with EACCES). The behaviour under test — EOF
+-- dropping the peer, reconnects succeeding, and a stale handle not evicting a
+-- fresh one — is identical either way, so the test follows the platform.
 local uv = vim.uv
+local is_windows = package.config:sub(1, 1) == "\\"
 
 local function assert_true(cond, msg)
   if not cond then
@@ -17,8 +24,10 @@ local real_cwd = uv.fs_realpath(vim.fn.getcwd()) or vim.fn.getcwd()
 
 local dir = vim.fn.tempname()
 vim.fn.mkdir(dir, "p")
-local sock = dir .. "/1.sock"
-local info = sock .. ".info"
+-- On Windows the pipe name is the transport and lives in the payload, so the
+-- .info file cannot be `${sock}.info`; the plugin reads `pipe` instead.
+local sock = is_windows and ("\\\\.\\pipe\\omp-pipe-liveness-" .. tostring(vim.fn.getpid())) or (dir .. "/1.sock")
+local info = is_windows and (dir .. "/1.info") or (sock .. ".info")
 
 local server = uv.new_pipe(false)
 assert_true(server:bind(sock) ~= nil, "Could not bind test socket")
@@ -30,7 +39,7 @@ end) ~= nil, "Could not listen on test socket")
 
 local f = io.open(info, "w")
 assert_true(f ~= nil, "Could not write info file")
-f:write(vim.json.encode({ cwd = real_cwd }))
+f:write(vim.json.encode(is_windows and { cwd = real_cwd, pipe = sock } or { cwd = real_cwd }))
 f:close()
 
 -- Discovery connects and stores the live pipe handle
